@@ -1,7 +1,8 @@
 # The Windows build: `wow-reforged.exe`, the fork's one shipping target, built by the same script a
 # release runs (`scripts/build-desktop.sh`). `ci.yml` already compiles the workspace on Windows for
 # a fork's pull request; this workflow is where the exe is made - main, a version tag, or a
-# dispatch - and the binary is the run's artifact.
+# dispatch - and the binary is the run's artifact. A main push builds `release` (no LTO) so the run
+# stays short; a `v*` tag builds `ship` (fat LTO), the profile that ships.
 name: Windows build
 
 on:
@@ -13,8 +14,8 @@ on:
       profile:
         description: "Cargo profile (ship is the shipping build)"
         type: choice
-        options: [ship, release]
-        default: ship
+        options: [release, ship]
+        default: release
 
 permissions:
   contents: read
@@ -26,13 +27,15 @@ concurrency:
 jobs:
   build:
     runs-on: windows-latest
-    timeout-minutes: 240
+    timeout-minutes: 360
     env:
       CARGO_TERM_COLOR: always
       CARGO_INCREMENTAL: 0
+      CARGO_NET_RETRY: 10
+      CARGO_HTTP_TIMEOUT: 60
       # The player build reads no install; a build must not need one.
       WOW_DATA: ""
-      BENILLA_DESKTOP_PROFILE: ${{ github.event.inputs.profile || 'ship' }}
+      BENILLA_DESKTOP_PROFILE: ${{ github.event.inputs.profile || (startsWith(github.ref, 'refs/tags/v') && 'ship' || 'release') }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -97,8 +100,26 @@ jobs:
               with open("web/favicon.ico", "wb") as icon:
                   icon.write(struct.pack("<HHH", 0, 1, 1) + entry + image)
 
-      # `scripts/build-desktop.sh` defaults to the shipping build: fat LTO, x86-64-v3, the MSVC
-      # runtime linked statically. `tee` keeps the log the next step reads.
+      # `mach-dxcompiler-rs` asks GitHub's API and then downloads its archive with a `curl` that has
+      # no timeout; a stalled connection hangs the build. Fetch the pinned archive here with a
+      # deadline and a checksum, and hand it over through the local-copy switch
+      # (`third_party/mach-dxcompiler-rs/BENILLA.md`). The archive is the `+crt-static` one, which
+      # `scripts/build-desktop.sh` always links.
+      - name: Fetch DXC
+        shell: pwsh
+        run: |
+          $url = 'https://github.com/DouglasDwyer/mach-dxcompiler/releases/download/2026.10.26+141dd7f.1/x86_64-windows-msvc_ReleaseFast_lib.tar.gz'
+          $sha256 = '908305e46a7f100b240f29235b0844006ced9c0cf22c95d019e3d59c14346725'
+          $archive = Join-Path $env:RUNNER_TEMP 'mach-dxcompiler.tar.gz'
+          curl.exe --fail --location --retry 5 --retry-all-errors --connect-timeout 20 --max-time 900 --output $archive $url
+          if ($LASTEXITCODE -ne 0) { throw "curl failed with $LASTEXITCODE" }
+          $actual = (Get-FileHash $archive -Algorithm SHA256).Hash.ToLowerInvariant()
+          if ($actual -ne $sha256) { throw "DXC archive sha256 $actual, expected $sha256" }
+          "MACH_DXC_ARCHIVE=$archive" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
+      # `scripts/build-desktop.sh` builds the profile `BENILLA_DESKTOP_PROFILE` names: x86-64-v3,
+      # the MSVC runtime linked statically, fat LTO under `ship`. `tee` keeps the log the next step
+      # reads.
       - name: Build
         shell: bash
         run: bash scripts/build-desktop.sh 2>&1 | tee build.log
