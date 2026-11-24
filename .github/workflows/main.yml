@@ -1,0 +1,121 @@
+# The Windows build: `wow-reforged.exe`, the fork's one shipping target, built by the same script a
+# release runs (`scripts/build-desktop.sh`). `ci.yml` already compiles the workspace on Windows for
+# a fork's pull request; this workflow is where the exe is made - main, a version tag, or a
+# dispatch - and the binary is the run's artifact.
+name: Windows build
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      profile:
+        description: "Cargo profile (ship is the shipping build)"
+        type: choice
+        options: [ship, release]
+        default: ship
+
+permissions:
+  contents: read
+
+concurrency:
+  group: windows-build-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: windows-latest
+    timeout-minutes: 240
+    env:
+      CARGO_TERM_COLOR: always
+      CARGO_INCREMENTAL: 0
+      # The player build reads no install; a build must not need one.
+      WOW_DATA: ""
+      BENILLA_DESKTOP_PROFILE: ${{ github.event.inputs.profile || 'ship' }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # A release Bevy build is most of a runner's disk; none of these is read by the build.
+      - name: Free disk space
+        shell: pwsh
+        run: |
+          foreach ($dir in @(
+            'C:\Program Files\dotnet',
+            'C:\Program Files\Android',
+            'C:\Program Files (x86)\Android',
+            'C:\Program Files\Microsoft SDKs\Azure',
+            'C:\Program Files (x86)\Microsoft SDKs\Azure'
+          )) {
+            if (Test-Path $dir) { Remove-Item -Recurse -Force $dir -ErrorAction SilentlyContinue }
+          }
+          Get-ChildItem 'C:\hostedtoolcache\windows' -Directory -Filter 'Java_*' -ErrorAction SilentlyContinue |
+            Remove-Item -Recurse -Force -ErrorAction SilentlyContinue
+
+      - name: Toolchain
+        run: rustup toolchain install && rustc -V
+
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+
+      # `third_party/dlss_wgpu` bindgens the NGX headers and quietly falls back to its mock when
+      # libclang is missing (docs/METHOD.md). Point it at the LLVM the image ships.
+      - name: libclang, so DLSS is real
+        shell: pwsh
+        run: |
+          $candidates = @('C:\Program Files\LLVM\bin')
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          if (Test-Path $vswhere) {
+            $vs = & $vswhere -latest -products * -property installationPath
+            if ($vs) { $candidates += (Join-Path $vs 'VC\Tools\Llvm\x64\bin') }
+          }
+          $llvm = $candidates |
+            Where-Object { Test-Path (Join-Path $_ 'libclang.dll') } |
+            Select-Object -First 1
+          if (-not $llvm) { throw 'no libclang.dll found: install LLVM or set LIBCLANG_PATH' }
+          "LIBCLANG_PATH=$llvm" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
+      # `web/favicon.ico` is not in this repository (FORK.md: the private builds put WoW.exe's own
+      # icon there), and `benilla-desktop`'s build script embeds it into a Windows exe. A build
+      # needs a file of that name, so one is written when the checkout has none; a release
+      # substitutes the real one.
+      - name: Placeholder icon
+        shell: python
+        run: |
+          import os
+          import struct
+
+          if not os.path.exists("web/favicon.ico"):
+              width = height = 16
+              image = (
+                  struct.pack("<IiiHHIIiiII", 40, width, height * 2, 1, 32, 0, 0, 0, 0, 0, 0)
+                  + b"\x00" * (width * height * 4)
+                  + b"\x00" * (height * 4)
+              )
+              entry = struct.pack("<BBBBHHII", width, height, 0, 0, 1, 32, len(image), 22)
+              with open("web/favicon.ico", "wb") as icon:
+                  icon.write(struct.pack("<HHH", 0, 1, 1) + entry + image)
+
+      # `scripts/build-desktop.sh` defaults to the shipping build: fat LTO, x86-64-v3, the MSVC
+      # runtime linked statically. `tee` keeps the log the next step reads.
+      - name: Build
+        shell: bash
+        run: bash scripts/build-desktop.sh 2>&1 | tee build.log
+
+      # docs/METHOD.md: a desktop build links the real DLSS, never its mock. The mock warns.
+      - name: DLSS was linked, not mocked
+        shell: pwsh
+        run: |
+          if (Select-String -Path build.log -Pattern 'building the mock \(no DLSS\)' -Quiet) {
+            throw 'dlss_wgpu built its mock: the exe would ship without DLSS'
+          }
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: wow-reforged-windows-x64
+          path: |
+            target/desktop/wow-reforged.exe
+            target/desktop/wow-reforged.exe.version
+          if-no-files-found: error
+          retention-days: 14
